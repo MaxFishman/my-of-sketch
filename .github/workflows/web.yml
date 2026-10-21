@@ -1,0 +1,202 @@
+name: Build for the web
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the sketch
+        uses: actions/checkout@v7
+        with:
+          path: sketch
+
+      - name: Get openFrameworks 0.12.1
+        run: git clone --depth 1 --branch 0.12.1 https://github.com/openframeworks/openFrameworks.git of
+
+      - name: Download openFrameworks web libraries
+        run: ./of/scripts/emscripten/download_libs.sh
+
+      - name: Start emscripten
+        run: docker run -di --name emscripten -v "$PWD":/src emscripten/emsdk:4.0.4 bash
+
+      - name: Build openFrameworks for the web
+        run: |
+          sed -i "s/PLATFORM_OPTIMIZATION_CFLAGS_DEBUG = .*/PLATFORM_OPTIMIZATION_CFLAGS_DEBUG = -g0/" of/libs/openFrameworksCompiled/project/emscripten/config.emscripten.default.mk
+          docker exec -w /src/of/libs/openFrameworksCompiled/project emscripten emmake make -j4 Release
+
+      - name: Set up the sketch project
+        run: |
+          mkdir -p of/apps/myApps/sketch/bin/data
+          cp -r sketch/src of/apps/myApps/sketch/
+          if [ -d sketch/bin/data ]; then cp -r sketch/bin/data/. of/apps/myApps/sketch/bin/data/; fi
+          # the web packager fails on an empty data folder, so always keep one small file in it
+          echo "web build" > of/apps/myApps/sketch/bin/data/web.txt
+          # the prebuilt web libraries expect reallocarray, which this emscripten version leaves out
+          cat > of/apps/myApps/sketch/src/web_compat.c <<'EOF'
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <errno.h>
+          void *reallocarray(void *ptr, size_t nmemb, size_t size) {
+            if (size != 0 && nmemb > SIZE_MAX / size) { errno = ENOMEM; return NULL; }
+            return realloc(ptr, nmemb * size);
+          }
+          EOF
+          cp of/scripts/templates/emscripten/Makefile of/apps/myApps/sketch/
+          cp of/scripts/templates/emscripten/config.make of/apps/myApps/sketch/
+          ls -la of/apps/myApps/sketch/src
+
+      - name: Build the sketch for the web
+        run: |
+          docker exec -w /src/of/apps/myApps/sketch emscripten emmake make -j4 Release
+          sudo chown -R "$(id -u):$(id -g)" of/apps/myApps/sketch/bin
+
+      - name: Make the page work on GitHub Pages
+        run: |
+          # openFrameworks web builds use threads, which need extra server headers.
+          # GitHub Pages can't set them, so this small helper script adds them in the browser.
+          OUT=of/apps/myApps/sketch/bin/em/sketch
+          curl -fsSL -o "$OUT/coi-serviceworker.min.js" https://unpkg.com/coi-serviceworker@0.1.7/coi-serviceworker.min.js
+          sed -i 's#<head>#<head>\n    <script src="coi-serviceworker.min.js"></script>#' "$OUT/index.html"
+          grep -n "coi-serviceworker" "$OUT/index.html"
+          # Reskin the page: hide the default emscripten menu/output, center the sketch
+          # on a dark stage, and keep one nice glass "Fullscreen" button. Also inject the
+          # fullscreen fixes: CSS so a fullscreen canvas fills the screen, and a safe
+          # button handler that beats the template's broken pointer-lock one (which throws
+          # NotAllowedError and collapses the canvas to 0x0 -> black). Python keeps the
+          # multi-line CSS/JS clean (the nodes app.js needs are hidden, never removed).
+          python3 - "$OUT/index.html" <<'PY'
+          import sys
+          p = sys.argv[1]
+          style = """  <style>
+          html,body{margin:0;height:100%;overflow:hidden;background:#0d0d11;
+            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;}
+          /* hide the default emscripten chrome, but keep the nodes app.js references */
+          #logo,#spinner,#status,#output,#progress,
+          #controls>span:nth-child(1),#controls>span:nth-child(2){display:none!important;}
+          #header{position:static!important;background:none!important;border:0!important;
+            box-shadow:none!important;margin:0!important;padding:0!important;}
+          /* the one control we keep, floated top-right */
+          #controls{position:fixed;top:18px;right:18px;z-index:30;margin:0;}
+          #fullscreenButton{-webkit-appearance:none;appearance:none;cursor:pointer;
+            font:600 14px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+            color:#fff;letter-spacing:.02em;padding:11px 17px;border-radius:11px;
+            background:rgba(22,22,28,.55);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+            border:1px solid rgba(255,255,255,.22);box-shadow:0 4px 18px rgba(0,0,0,.35);
+            transition:background .15s ease,transform .06s ease,border-color .15s ease;}
+          #fullscreenButton:hover{background:rgba(44,44,56,.8);border-color:rgba(255,255,255,.42);}
+          #fullscreenButton:active{transform:translateY(1px);}
+          #fullscreenButton:focus-visible{outline:2px solid #7dd3fc;outline-offset:2px;}
+          /* center the sketch on the stage, scaled to the viewport, 4:3 preserved */
+          .emscripten_border{border:0!important;margin:0!important;padding:0!important;
+            min-height:100vh;display:flex;align-items:center;justify-content:center;}
+          #canvas{display:block;background:#000;aspect-ratio:4/3!important;
+            width:min(94vw,calc(92vh*4/3))!important;height:auto!important;
+            border-radius:8px;box-shadow:0 14px 60px rgba(0,0,0,.6);}
+          #canvas:fullscreen{position:fixed!important;top:0!important;left:0!important;
+            width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;
+            border-radius:0!important;box-shadow:none!important;}
+          /* small, dismissable "publish your own sketch" button, top-left */
+          #ofUploadBtn{position:fixed;top:18px;left:18px;z-index:30;display:flex;align-items:center;gap:9px;
+            text-decoration:none;cursor:pointer;color:#fff;letter-spacing:.02em;
+            font:600 13px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+            padding:10px 11px 10px 14px;border-radius:11px;
+            background:rgba(22,22,28,.55);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+            border:1px solid rgba(255,255,255,.22);box-shadow:0 4px 18px rgba(0,0,0,.35);
+            transition:background .15s ease,border-color .15s ease;}
+          #ofUploadBtn:hover{background:rgba(44,44,56,.8);border-color:rgba(255,255,255,.42);}
+          #ofUploadBtn .x{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;
+            border-radius:50%;background:rgba(255,255,255,.12);color:#cfcfd6;font-size:13px;line-height:1;}
+          #ofUploadBtn .x:hover{background:rgba(255,61,110,.92);color:#1a0710;}
+          </style>
+          </head>"""
+          script = """  <a id="ofUploadBtn" href="https://maxfishman.github.io/OpenFrameworksTest/uploader/" title="Publish your own openFrameworks sketch">
+          <span>Publish your sketch &#8599;</span>
+          <span class="x" id="ofUploadHide" role="button" aria-label="Hide" title="Hide">&times;</span>
+          </a>
+          <script>
+          (function(){
+            function go(){
+              var c=document.getElementById('canvas'); if(!c) return;
+              if(document.fullscreenElement){ if(document.exitFullscreen) document.exitFullscreen(); return; }
+              var req=c.requestFullscreen||c.webkitRequestFullscreen; if(req) req.call(c);
+            }
+            // beat the template's broken handler (pointer-lock -> 0x0 canvas -> black)
+            document.addEventListener('click',function(e){
+              var t=e.target;
+              if(t&&t.id==='fullscreenButton'){ e.stopImmediatePropagation(); e.preventDefault(); go(); }
+            },true);
+            function label(){
+              var b=document.getElementById('fullscreenButton'); if(!b) return;
+              b.value = document.fullscreenElement ? '\\u26f6  Exit' : '\\u26f6  Fullscreen';
+            }
+            document.addEventListener('fullscreenchange',label);
+            document.addEventListener('DOMContentLoaded',label);
+            label();
+          })();
+          (function(){
+            var KEY='ofUploaderHidden', btn=document.getElementById('ofUploadBtn');
+            if(!btn) return;
+            try{ if(localStorage.getItem(KEY)) btn.style.display='none'; }catch(e){}
+            var x=document.getElementById('ofUploadHide');
+            if(x) x.addEventListener('click',function(e){
+              e.preventDefault(); e.stopPropagation(); btn.style.display='none';
+              try{ localStorage.setItem(KEY,'1'); }catch(e){}
+            });
+          })();
+          </script>
+          </body>"""
+          s = open(p).read()
+          assert '</head>' in s and '</body>' in s, 'index.html missing head/body'
+          s = s.replace('</head>', style, 1).replace('</body>', script, 1)
+          open(p,'w').write(s)
+          print('reskinned page + injected fullscreen fixes')
+          PY
+          grep -nE "fullscreenButton|canvas:fullscreen|emscripten_border" "$OUT/index.html" | head
+          ls -la "$OUT"
+
+      - name: Publish the uploader page
+        run: |
+          OUT=of/apps/myApps/sketch/bin/em/sketch
+          if [ -d sketch/web/uploader ]; then
+            mkdir -p "$OUT/uploader"
+            cp -r sketch/web/uploader/. "$OUT/uploader/"
+            # bundle the CURRENT workflow so repos created by the uploader get all the fixes
+            B64=$(base64 -w0 sketch/.github/workflows/web.yml)
+            printf 'window.__WEB_YML_B64__=%s;\n' "\"$B64\"" > "$OUT/uploader/workflow.js"
+            echo "uploader published:"; ls -la "$OUT/uploader"
+          else
+            echo "no web/uploader directory in this repo; skipping"
+          fi
+
+      - name: Package the web page
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: of/apps/myApps/sketch/bin/em/sketch
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
